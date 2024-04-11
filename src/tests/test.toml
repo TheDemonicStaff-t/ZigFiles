@@ -1,0 +1,32 @@
+# this is a test, let's hope it works well
+string_test = "this is a string test"                               # test eol comments
+int_test = 69420
+signed_int_test = -1000
+spaced_int_test = 69_420
+hex_test = 0xCAFEBABE
+octal_test = 0o377
+binary_test = 0b10111011
+float_test = 3.14159
+exponent_test = 6.022e-23
+infinity_test = -inf
+nan_test = -nan
+tbool_test = true
+fbool_test = false
+offset_date_time_test = 2024-04-10T12:56:49-05:00
+local_date_time_test = 2024-04-10T01:00:12
+local_date = 2024-04-10
+tocal_time = 01:00:58
+array_test = ["this", "is", "a", "test"]
+mixed_array_test = ['p', 1, 'u', 2, 'b', 3, 'l', 4, 'i', 5, 'c', 6]
+
+# object nested table array test
+[[table_test]]
+table_val_test = 69420
+table_val_text = "oh yeah!"
+
+[[table_test.test_obj]]
+table_test_val = 42069
+
+[[table_test.array_test]]
+test_array_val_1 = 1234
+test_array_val_2 = "please work"
