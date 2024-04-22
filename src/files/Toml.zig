@@ -172,9 +172,109 @@ pub fn parseId(self: *Toml) ![]const u8 {
 /// FOR INTERNAL USE ONLY
 pub fn parseValue(self: *Toml) !TableValue {
     switch (self.text[self.idx]) {
+        '\'', '\"' => {
+            var start = self.idx;
+            self.idx += 1;
+            if (self.text[self.idx] == '\'') {
+                while (self.idx < self.text.len and self.text[self.idx] != '\'') self.idx += 1;
+                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx } } else return error.StringOverflow;
+            } else {
+                while (self.idx < self.text.len and self.text[self.idx] != '\"') : (self.idx += 1) {
+                    if (self.text[self.idx] == '\\' and self.text[self.idx + 1] == '\"') self.idx += 1;
+                }
+                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx } } else return error.StringOverflow;
+            }
+        },
+        '+', '-', '0'...'9', 'i', 'n' => {
+            var start = self.idx;
+            var is_float = false;
+            if (self.text[self.idx] == '+' or self.text[self.idx] == '-') self.idx += 1;
+            if (self.text[self.idx] == 'i' or self.text[self.idx] == 'n') {
+                if (self.text.len <= self.idx + 2) return error.UnknownConcept;
+                self.idx += 1;
+                if (self.text[self.idx] == 'n' and self.text[self.idx + 1] == 'f') {
+                    self.idx += 2;
+                    return .{ .tag = .Concept, .loc = .{ .start = start, .end = self.idx } };
+                } else if (self.text[self.idx] == 'a' and self.text[self.idx + 1] == 'n') {
+                    self.idx += 2;
+                    return .{ .tag = .Concept, .loc = .{ .start = start, .end = self.idx } };
+                } else return error.UnknownConcept;
+            } else if (self.text.len > self.idx + 9 and self.text[self.idx + 4] == '-' and self.text[self.idx + 7] == '-') {
+                self.idx += 10;
+                if (self.text.len > self.idx and self.text[self.idx] == 'T') {
+                    self.idx += 1;
+                    if (self.text.len > self.idx + 7 and self.text[self.idx + 2] == ':' and self.text[self.idx + 5] == ':') {
+                        self.idx += 8;
+                        if (self.text.len > self.idx and self.text[self.idx] == '.') {
+                            std.debug.print("offset date time detected\n", .{});
+                            self.idx += 1;
+                            while (self.text.len > self.idx and self.text[self.idx] > 47 and self.text[self.idx] < 58) self.idx += 1;
+                        }
+                        if (self.text.len > self.idx + 5 and (self.text[self.idx] == '+' or self.text[self.idx] == '-') and self.text[self.idx + 3] == ':') {
+                            self.idx += 6;
+                            return .{ .tag = .OffsetDateTime, .loc = .{ .start = start, .end = self.idx } };
+                        } else return .{ .tag = .LocalDateTime, .loc = .{ .start = start, .end = self.idx } };
+                    } else return error.InvalidTimeInDateTime;
+                } else return .{ .tag = .Date, .loc = .{ .start = start, .end = self.idx } };
+            } else if (self.text.len > self.idx + 7 and self.text[self.idx + 2] == ':' and self.text[self.idx + 5] == ':') {
+                self.idx += 8;
+                if (self.text.len > self.idx and self.text[self.idx] == '.') {
+                    self.idx += 1;
+                    while (self.text.len > self.idx and (self.text[self.idx] > 47 and self.text[self.idx] < 58)) self.idx += 1;
+                }
+                return .{ .tag = .Time, .loc = .{ .start = start, .end = self.idx } };
+            }
+            if (self.text[self.idx] == '0') {
+                self.idx += 1;
+                switch (self.text[self.idx]) {
+                    'x', 'X' => {
+                        self.idx += 1;
+                        while (self.idx < self.text.len and ((self.text[self.idx] > 47 and self.text[self.idx] < 58) or (self.text[self.idx] > 64 and self.text[self.idx] < 71) or (self.text[self.idx] > 96 and self.text[self.idx] < 103) or self.text[self.idx] == '_')) self.idx += 1;
+                    },
+                    'o', 'O' => {
+                        self.idx += 1;
+                        while (self.idx < self.text.len and ((self.text[self.idx] > 47 and self.text[self.idx] < 56) or self.text[self.idx] == '_')) self.idx += 1;
+                    },
+                    'b', 'B' => {
+                        self.idx += 1;
+                        while (self.idx < self.text.len and ((self.text[self.idx] > 47 and self.text[self.idx] < 50) or self.text[self.idx] == '_')) self.idx += 1;
+                    },
+                    else => return error.UnkownIntegerType,
+                }
+            } else while (self.idx < self.text.len and ((self.text[self.idx] > 47 and self.text[self.idx] < 58) or self.text[self.idx] == '_')) self.idx += 1;
+            if (self.idx < self.text.len and self.text[self.idx] == '.') {
+                self.idx += 1;
+                while (self.idx < self.text.len and ((self.text[self.idx] > 47 and self.text[self.idx] < 58) or self.text[self.idx] == '_')) self.idx += 1;
+                is_float = true;
+            }
+            if (self.idx < self.text.len and (self.text[self.idx] == 'e' or self.text[self.idx] == 'E')) {
+                self.idx += 1;
+                is_float = true;
+                if (self.text[self.idx] == '+' or self.text[self.idx] == '-') self.idx += 1;
+                while (self.idx < self.text.len and self.text[self.idx] > 47 and self.text[self.idx] < 58) self.idx += 1;
+            }
+            if (is_float) return .{ .tag = .Float, .loc = .{ .start = start, .end = self.idx } };
+            return if (self.idx <= self.text.len) TableValue{ .tag = .Integer, .loc = .{ .start = start, .end = self.idx } } else return error.IntegerOverflow;
+        },
+        't', 'f' => {
+            var start = self.idx;
+            if (self.text.len >= self.idx + 3 and self.text[self.idx + 1] == 'r' and self.text[self.idx + 2] == 'u' and self.text[self.idx + 3] == 'e') {
+                self.idx += 4;
+                return .{ .tag = .Boolean, .loc = .{ .start = start, .end = self.idx } };
+            } else if (self.text.len > self.idx + 4 and self.text[self.idx + 1] == 'a' and self.text[self.idx + 2] == 'l' and self.text[self.idx + 3] == 's' and self.text[self.idx + 4] == 'e') {
+                self.idx += 5;
+                return .{ .tag = .Boolean, .loc = .{ .start = start, .end = self.idx } };
+            } else return error.InvalidBoolean;
+        },
+        '[' => {
+            var start = self.idx;
+            while (self.text.len > self.idx and self.text[self.idx] != ']') self.idx += 1;
+            if (self.text.len <= self.idx) return error.InvalidArrayProvided;
+            self.idx += 1;
+            return .{ .tag = .Array, .loc = .{ .start = start, .end = self.idx } };
+        },
         else => return error.InvalidValueProvided,
     }
-    self.idx += 1;
 }
 
 // fetching functions (internal)
@@ -285,25 +385,29 @@ pub const Loc = struct { start: usize, end: usize };
 pub const Tag = enum {
     String,
     Integer,
+    Concept,
     Float,
     Boolean,
     OffsetDateTime,
     LocalDateTime,
     Date,
     Time,
+    Array,
 };
 pub const TableValue = struct { tag: Tag, loc: Loc };
 pub const TomlValue = union(Tag) {
     String: []const u8,
     Integer: i64,
+    Concept: TomlConcept,
     Float: f64,
     Boolean: bool,
     OffsetDateTime: TomlOffsetDateTime,
     LocalDateTime: TomlLocalDateTime,
     Date: TomlDate,
     Time: TomlTime,
+    Array: []TomlValue,
 };
-
+pub const TomlConcept = enum { INFINITY, NOT_A_NUMBER };
 pub const TomlOffsetDateTime = struct { date: TomlDate, time: TomlTime, offset: TomlTimezone };
 pub const TomlLocalDateTime = struct { date: TomlDate, time: TomlTime };
 pub const TomlDate = struct {
@@ -385,7 +489,7 @@ test "Toml Escape Key Test" {
     }
 }
 
-test "Toml Parse Table Name" {
+test "Toml Table Name Test" {
     const tbl_name_1 = "p.ass.\'ed\']";
     const tbl_name_2 = "p.ass.\"e\\x64\"]";
     const nest_tbl_1 = "[p.ass]]";
@@ -430,4 +534,64 @@ test "Toml Parse Table Name" {
     try std.testing.expect(eql(u8, "p.ass[0].ed[0]", toml.active_prefix.?));
     toml.alloc.free(toml.active_prefix.?);
     toml.active_prefix = null;
+}
+
+test "Toml Value Parse Test" {
+    const tests = [_][]const u8{
+        "\"\\\"passed\\\"\"",
+        "69420",
+        "-69420",
+        "69_420",
+        "0xCAFEBABE",
+        "0o377",
+        "0b10111011",
+        "3.14159",
+        "6.022e-23",
+        "-inf",
+        "-nan",
+        "true",
+        "false",
+        "2024-04-10T12:56:49-05:00",
+        "2024-04-10T01:00:12",
+        "2024-04-10",
+        "01:00:58",
+        "[\"test\", \"passed\"]",
+        "['p', 1, 'u', 2, 'b', 3, 'l', 4, 'i', 5, 'c', 6]",
+    };
+
+    const table_results = [_]TableValue{
+        .{ .tag = .String, .loc = .{ .start = 0, .end = 11 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 5 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 6 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 6 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 10 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 5 } },
+        .{ .tag = .Integer, .loc = .{ .start = 0, .end = 10 } },
+        .{ .tag = .Float, .loc = .{ .start = 0, .end = 7 } },
+        .{ .tag = .Float, .loc = .{ .start = 0, .end = 9 } },
+        .{ .tag = .Concept, .loc = .{ .start = 0, .end = 4 } },
+        .{ .tag = .Concept, .loc = .{ .start = 0, .end = 4 } },
+        .{ .tag = .Boolean, .loc = .{ .start = 0, .end = 4 } },
+        .{ .tag = .Boolean, .loc = .{ .start = 0, .end = 5 } },
+        .{ .tag = .OffsetDateTime, .loc = .{ .start = 0, .end = 25 } },
+        .{ .tag = .LocalDateTime, .loc = .{ .start = 0, .end = 19 } },
+        .{ .tag = .Date, .loc = .{ .start = 0, .end = 10 } },
+        .{ .tag = .Time, .loc = .{ .start = 0, .end = 8 } },
+        .{ .tag = .Array, .loc = .{ .start = 0, .end = 18 } },
+        .{ .tag = .Array, .loc = .{ .start = 0, .end = 48 } },
+    };
+
+    for (tests, table_results[0..tests.len], 0..) |input, table, i| {
+        var toml = Toml{
+            .alloc = std.testing.allocator,
+            .table = undefined,
+            .text = input,
+        };
+
+        var out = try toml.parseValue();
+        std.debug.print("{d}: {s}: [{d}, {d}]\n", .{ i, @tagName(out.tag), out.loc.start, out.loc.end });
+        try std.testing.expect(out.tag == table.tag);
+        try std.testing.expect(out.loc.start == table.loc.start);
+        try std.testing.expect(out.loc.end == table.loc.end);
+    }
 }
