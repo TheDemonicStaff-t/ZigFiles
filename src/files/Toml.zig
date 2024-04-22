@@ -5,236 +5,369 @@ const ArrayList = std.ArrayList;
 // imported functions
 const fixedBufferStream = std.io.fixedBufferStream;
 const eql = std.mem.eql;
+const format = std.fmt.format;
 
 const Toml = @This();
 
-keys: []*[]const u8 = undefined,
-values: []TomlValue = undefined,
-file: []const u8,
 alloc: Allocator,
+table: std.StringHashMap(TableValue),
+text: []const u8,
+active_prefix: ?[]const u8 = null,
+array_counts: ?std.StringHashMap(u64) = null,
+idx: usize = 0,
 
-pub fn init(alloc: Allocator, file: []const u8) !Toml {}
-
-pub const Lexer = struct {
-    toks: []Tok = undefined,
-    index: usize = 0,
-    file: []const u8,
-    idx: usize = 0,
-    alloc: Allocator,
-
-    pub fn init(alloc: Allocator, file: []const u8) !Lexer {
-        var l = Lexer{ .alloc = alloc, .file = file };
-        var toks = ArrayList(Tok).init(alloc);
-        defer toks.deinit();
-
-        while (l.idx < l.file.len) : (l.idx += 1) {
-            switch (l.file[l.idx]) {
-                ' ', '\t', '\n' => {},
-                '#' => {
-                    while (l.file[l.idx] != '\n') l.idx += 1;
-                    l.idx += 1;
-                },
-                '.' => try toks.append(Tok.init_simple(.period)),
-                '=' => try toks.append(Tok.init_simple(.equal)),
-                ',' => try toks.append(Tok.init_simple(.comma)),
-                '[' => try toks.append(Tok.init_simple(.left_sqr_brace)),
-                ']' => try toks.append(Tok.init_simple(.right_sqr_brace)),
-                '{' => try toks.append(Tok.init_simple(.left_curl_brace)),
-                '}' => try toks.append(Tok.init_simple(.right_curl_brace)),
-                '-', '+', 'i', 'n' => try toks.append(try Tok.init_num(l)),
-                '0'...'9' => {},
-                else => return error.UnknownTokenError,
-            }
-        }
-
-        l.toks = try toks.toOwnedSlice();
-
-        return l;
+/// Initializes Toml from recieved text. Result must have deinit() called before end of execution.
+pub fn init(text: []const u8, alloc: Allocator) !Toml {
+    var toml = Toml{
+        .alloc = alloc,
+        .table = std.StringHashMap(TableValue).init(alloc),
+        .text = text,
+        .array_counts = std.StringHashMap(u64).init(alloc),
+    };
+    errdefer toml.deinit();
+    try toml.parse();
+    if (toml.array_counts) |arrays| {
+        var array_iter = arrays.iterator();
+        while (array_iter.next()) |entry| alloc.free(entry.key_ptr.*);
+        toml.array_counts.?.deinit();
+        toml.array_counts = null;
     }
+    if (toml.active_prefix) |prefix| {
+        alloc.free(prefix);
+        toml.active_prefix = null;
+    }
+    return toml;
+}
 
-    pub fn next(self: *Lexer) !Tok {}
-    pub fn dec(self: *Lexer) !void {}
-
-    pub const Tok = struct {
-        type: TokType,
-        data: ?TokValue = undefined,
-
-        fn init(t: TokType, data: anytype) !Tok {
-            var tok = Tok{ .type = t };
-            var has_data = false;
-            inline for (@typeInfo(TokValue).Union.fields) |field| {
-                if (field.type == @TypeOf(data)) {
-                    tok.data = @unionInit(TokValue, field.name, data);
-                    has_data = true;
-                }
-            }
-            if (!has_data) {
-                tok.data = null;
-            }
-
-            return tok;
+/// This is for internal use when initially parsing the initializing text and should not be called outside
+/// of initialization.
+pub fn parse(self: *Toml) !void {
+    while (self.idx < self.text.len) : (self.idx += 1) {
+        //self.skipNlWhitespace();
+        // detect prefix or id
+        if (self.text[self.idx] == '[') {
+            //try self.parsePrefix();
+        } else if (self.text[self.idx] == '#') {
+            self.skipComment();
+        } else {
+            // parse key value pair and add to table
+            //var key = try self.parseId();
         }
+    }
+}
 
-        fn init_simple(t: TokType) Tok {
-            return .{ .type = t, .data = null };
-        }
+/// FOR INTERNAL USE ONLY
+pub fn parsePrefix(self: *Toml) !void {
+    if (self.active_prefix) |prefix| self.alloc.free(prefix);
+    var fin_prefix = ArrayList(u8).init(self.alloc);
+    errdefer fin_prefix.deinit();
+    const prefix = fin_prefix.writer();
+    var start: usize = 0;
 
-        pub fn init_num(self: *Lexer) !Tok {
-            var is_neg = (self.file[self.idx] == '-');
-            if (is_neg or self.file[self.idx] == '+') self.idx += 1;
-            // infinity and not a number
-            if (self.file[self.idx] == 'i' or self.file[self.idx] == 'n') {
-                if (eql(u8, self.file[self.idx .. self.idx + 3], "inf")) {
-                    return try Tok.init(.num_concept, @TypeOf(@field(TokValue, "num_concept")).infinite);
-                } else if (eql(u8, self.file[self.idx .. self.idx + 3], "nan")) {
-                    return try Tok.init(.num_concept, @TypeOf(@field(TokValue, "num_concept")).not_a_number);
+    if (self.text[self.idx] == '[') {
+        // TODO: Implement table arrays (pain and death)
+        self.idx += 1;
+        start = self.idx;
+    } else {
+        start = self.idx;
+        while (self.text.len > self.idx and self.text[self.idx] != ']') : (self.idx += 1) {
+            if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t') {
+                if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
+                try self.skipWhitespace();
+                start = self.idx;
+                self.idx -= 1;
+            } else if (self.text[self.idx] == '\'' or self.text[self.idx] == '\"') {
+                if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
+                var idStr = try self.parseIdString();
+                if (idStr) |str| {
+                    try prefix.writeAll(str);
+                    self.alloc.free(str);
                 }
-            }
+                start = self.idx + 1;
+            } else if (self.text[self.idx] == '\n') return error.InvalidPrefixProvided;
+        }
+        if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
+        self.active_prefix = try fin_prefix.toOwnedSlice();
+    }
+}
+/// FOR INTERNAL USE ONLY
+pub fn parseIdString(self: *Toml) !?[]const u8 {
+    var start: usize = 0;
+    var fin_string = ArrayList(u8).init(self.alloc);
+    errdefer fin_string.deinit();
+    const string = fin_string.writer();
+    if (self.text[self.idx] == '\'') {
+        self.idx += 1;
+        start = self.idx;
+        if (self.idx >= self.text.len) return error.IncompleteString;
+        if (self.text[self.idx] == '\'') return null;
+        while (self.idx < self.text.len and self.text[self.idx] != '\'') : (self.idx += 1) {
+            if (self.text[self.idx] == '\n') return error.MultilineIdStringNotSupported;
+        }
+        try string.writeAll(self.text[start..self.idx]);
+        return try fin_string.toOwnedSlice();
+    } else if (self.text[self.idx] == '\"') {
+        self.idx += 1;
+        if (self.text[self.idx] == '\"') return error.MultilineIdStringNotSupported;
+        start = self.idx;
 
-            // parse int
-            var num: isize = 0;
-            if (self.file[self.idx] == '0') {
+        while (self.text[self.idx] != '\"') : (self.idx += 1) {
+            if (self.text[self.idx] == '\\') {
+                if (start < self.idx) try string.writeAll(self.text[start..self.idx]);
                 self.idx += 1;
-            } else while (self.file[self.idx] >= '0' and self.file[self.idx] <= '9') : (self.idx += 1) {
-                num *= 10;
-                num += @as(i64, @intCast(self.file[self.idx] - '0'));
-            }
-
-            if (is_neg) num *= -1;
-
-            // parse float/exponent
-            if (self.file[self.idx] == '.' or self.file[self.idx] == 'e' or self.file[self.idx] == 'E') {
-                var fnum = TomlFloat{ .whole_val = num };
-                // float
-                if (self.file[self.idx] == '.') {
-                    var unum: u64 = 0;
-                    while (self.file[self.idx] >= '0' and self.file[self.idx] <= '9') : (self.idx += 1) {
-                        unum *= 10;
-                        unum += @as(u64, @intCast(self.file[self.idx] - '0'));
-                    }
-                    fnum.fract_num = unum;
-                }
-                // exponent
-                if (self.file[self.idx] == 'e' or (self.file[self.idx] == 'E')) {
-                    num = 0;
-                    is_neg = false;
-                    self.idx += 1;
-                    is_neg = self.file[self.idx] == '-';
-                    if (self.file[self.idx] == '+' or is_neg) self.idx += 1;
-                    while (self.file[self.idx] >= '0' and self.file[self.idx] <= '9') : (self.idx += 1) {
-                        num *= 10;
-                        num += @as(i64, @intCast(self.file[self.idx] - '0'));
-                    }
-                    if (is_neg) num += -1;
-                    fnum.expo_val = num;
-                }
-
-                return try Tok.init(.float, fnum);
-            } else {
-                return try Tok.init(.int, num);
-            }
+                try self.genEscapeKey(string);
+                start = self.idx;
+                self.idx -= 1;
+            } else if (self.text[self.idx] == '\n') return error.MultilineIdStringNotSupported;
         }
+        try string.writeAll(self.text[start..self.idx]);
+        return try fin_string.toOwnedSlice();
+    } else return error.InvalidStringTypeProvided;
+}
+/// FOR INTERNAL USE ONLY
+pub fn parseIdSegment(self: *Toml) ![]const u8 {
+    var id_segment = ArrayList(u8).init(self.alloc);
+    errdefer id_segment.deinit();
+    const segment = id_segment.writer();
+    var start: usize = 0;
 
-        pub fn init_unum(self: *Lexer) !Tok {
-            if (self.file[self.idx + 2] == ':') {}
-            if (self.file[self.idx + 4] == '-') {
-                if (self.file[self.idx + 11] >= '0' and self.file[self.idx + 11] <= '9') {} else return try Tok.init(.date, try TomlDate.init(self));
-            }
-            // hex, octal, and binary format
-            if (self.file[self.idx] == '0') {
-                self.idx += 2;
-                var num: i64 = 0;
-                switch (self.file[self.idx - 1]) {
-                    'x' => {
-                        // hex
-                        while ((self.file[self.idx] >= '0' and self.file[self.idx] == '9') or (self.file[self.idx] >= 'a' and self.file[self.idx] <= 'f') or (self.file[self.idx] >= 'A' and self.file[self.idx] <= 'F')) : (self.idx += 1) {
-                            num *= 16;
-                            if (self.file[self.idx] >= '0' and self.file[self.idx] == '9') {
-                                num += @as(i64, @intCast(self.file[self.idx] - '0'));
-                            } else if (self.file[self.idx] >= 'a' and self.file[self.idx] <= 'f') {
-                                num += @as(i64, @intCast(self.file[self.idx] - 'a' + 10));
-                            } else {
-                                num += @as(i64, @intCast(self.file[self.idx] - 'A' + 10));
-                            }
-                        }
-                    },
-                    'o' => {
-                        // octal
-                        while (self.file[self.idx] >= '0' and self.file[self.idx] <= '7') {
-                            num *= 8;
-                            num += @as(i64, @intCast(self.file[self.idx] - '0'));
-                        }
-                    },
-                    'b' => {
-                        // binary
-                        while (self.file[self.idx] == '1' or self.file[self.idx] == '0') {
-                            num *= 2;
-                            num += @as(i64, @intCast(self.file[self.idx] - '0'));
-                        }
-                    },
-                    else => return error.UnknownIntRepresentation,
-                }
-                return Tok.init(.int, num);
-            }
-            // int format
-            var num: i64 = 0;
-            while (self.file[self.idx] >= '0' and self.file[self.idx] <= '9') : (self.idx += 1) {
-                num *= 10;
-                num += 10;
-            }
-            return try Tok.init(.int, num);
-        }
-    };
-    pub const TokType = enum { id, string, int, num_concept, float, boolean, time, date, date_time, left_sqr_brace, right_sqr_brace, left_curl_brace, right_curl_brace, period, equal, comma };
-    pub const TokValue = union(enum) {
-        string: []u8,
-        int: i64,
-        num_concept: enum { infinite, not_a_number },
-        float: TomlFloat,
-        boolean: bool,
-        date: TomlDate,
-        time: TomlTime,
-        date_time: TomlDateTime,
-    };
-};
-pub const TomlFloat = struct { whole_val: i64, fract_val: u64 = 0, expo_val: i64 = 0 };
-pub const TomlDateTime = struct {
-    date: TomlDate,
-    time: TomlTime,
-    pub fn init(l: *Lexer) !TomlDateTime {}
-};
-pub const TomlDate = struct {
-    year: u16,
-    month: u8,
-    day: u8,
-    pub fn init(l: *Lexer) !TomlDate {
-        if (l.file[l.idx + 4] != '-' or l.file[l.idx + 7] != '-') return error.NoDateDetected;
-        defer l.idx += 9;
-        return .{
-            .year = (@as(u16, @intCast(l.file[l.idx] - '0')) * 1000) + (@as(u16, @intCast(l.file[l.idx + 1] - '0')) * 100) + (@as(u16, @intCast(l.file[l.idx + 2] - '0')) * 10) + (@as(u16, @intCast(l.file[l.idx + 3] - '0'))),
-            .month = ((l.file[l.idx + 5] - '0') * 10) + (l.file[l.idx + 6] - '0'),
-            .day = ((l.file[l.idx + 8] - '0') * 10) + (l.file[l.idx + 9] - '0'),
-        };
+    while (self.text.len > self.idx and self.text[self.idx] != ']' and self.text[self.idx] != '.') : (self.idx += 1) {
+        if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t') {
+            if (self.idx - start > 0) try segment.writeAll(self.text[start..self.idx]);
+            try self.skipWhitespace();
+            start = self.idx;
+            self.idx -= 1; // decrement so while increment doesn't skip a char check
+        } else if (self.text[self.idx] == '\'' or self.text[self.idx] == '\"') {
+            if (self.idx - start > 0) try segment.writeAll(self.text[start..self.idx]);
+            var idStr = try self.parseIdString();
+            try segment.writeAll(idStr);
+            self.alloc.free(idStr);
+            start = self.idx;
+            self.idx -= 1;
+        } else if (self.text[self.idx] == '\n') return error.InvalidPrefixProvided;
     }
+}
+/// FOR INTERNAL USE ONLY
+pub fn parseId(self: *Toml) ![]const u8 {
+    while (self.text.len > self.idx and self.text[self.idx] != ' ' and self.text[self.idx] != '\t' and self.text[self.idx] != '\n') : (self.idx += 1) {}
+    if (self.text.len == self.idx or self.text[self.idx] == '\n') return error.InvalidKeyValuePair;
+}
+/// FOR INTERNAL USE ONLY
+pub fn parseValue(self: *Toml) !TableValue {
+    switch (self.text[self.idx]) {
+        else => return error.InvalidValueProvided,
+    }
+    self.idx += 1;
+}
+
+/// FOR INTERNAL USE ONLY
+pub fn genEscapeKey(self: *Toml, writer: anytype) !void {
+    switch (self.text[self.idx]) {
+        'b' => try writer.writeByte(8),
+        't' => try writer.writeByte(9),
+        'n' => try writer.writeByte(10),
+        'f' => try writer.writeByte(12),
+        'r' => try writer.writeByte(13),
+        '\"' => try writer.writeByte('\"'),
+        '\\' => try writer.writeByte('\\'),
+        'x', 'u', 'U' => try self.genHexCode(writer),
+        else => return error.InvalidValueProvided,
+    }
+    self.idx += 1;
+}
+
+pub fn genHexCode(self: *Toml, writer: anytype) !void {
+    if (self.text[self.idx] == 'x') {
+        var byte: u8 = 0;
+        for (0..2) |_| {
+            self.idx += 1;
+            byte *= 16;
+            byte += try getHexByte(self.text[self.idx]);
+        }
+        try writer.writeByte(byte);
+    } else if (self.text[self.idx] == 'u') {
+        var word: u16 = 0;
+        for (0..4) |_| {
+            self.idx += 1;
+            word *= 16;
+            word += try getHexByte(self.text[self.idx]);
+        }
+        try writer.writeInt(u16, word, .Little);
+    } else if (self.text[self.idx] == 'U') {
+        var dword: u32 = 0;
+        for (0..8) |_| {
+            self.idx += 1;
+            dword *= 16;
+            dword += try getHexByte(self.text[self.idx]);
+        }
+        try writer.writeInt(u32, dword, .Little);
+    } else return error.UnknownHexLength;
+}
+
+/// Feel free to use as you will
+pub fn getHexByte(char: u8) !u8 {
+    switch (char) {
+        '0'...'9' => return char - 48,
+        'a'...'f' => return char - 87,
+        'A'...'F' => return char - 55,
+        else => return error.UnknownHexChar,
+    }
+}
+
+/// FOR INTERNAL USE ONLY
+pub fn skipWhitespace(self: *Toml) !void {
+    while (self.text.len > self.idx and (self.text[self.idx] == ' ' or self.text[self.idx] == '\t')) : (self.idx += 1) if (self.text[self.idx] == '\n') return error.InvalidNewlineRecieved;
+}
+
+/// FOR INTERNAL USE ONLY
+pub fn skipNlWhitespace(self: *Toml) void {
+    while (self.text.len > self.idx and (self.text[self.idx] == ' ' or self.text[self.idx] == '\t' or self.text[self.idx] == '\n')) self.idx += 1;
+}
+
+/// FOR INTERNAL USE ONLY
+pub fn skipComment(self: *Toml) void {
+    while (self.text.len > self.idx and self.text[self.idx] != '\n') self.idx += 1;
+    self.idx += 1;
+}
+
+/// This must be called at the end of execution or the end of file life. It frees all of the keys
+/// that have been created.
+pub fn deinit(self: *Toml) void {
+    if (self.array_counts) |arrays| {
+        var array_iter = arrays.iterator();
+        while (array_iter.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.array_counts.?.deinit();
+    }
+    if (self.active_prefix) |prefix| self.alloc.free(prefix);
+    var hash_iter = self.table.iterator();
+    while (hash_iter.next()) |entry| self.alloc.free(entry.key_ptr.*);
+    self.table.deinit();
+}
+
+pub const Loc = struct { start: usize, end: usize };
+pub const Tag = enum {
+    String,
+    Integer,
+    Float,
+    Boolean,
+    OffsetDateTime,
+    LocalDateTime,
+    Date,
+    Time,
+};
+pub const TableValue = struct { tag: Tag, loc: Loc };
+pub const TomlValue = union(Tag) {
+    String: []const u8,
+    Integer: i64,
+    Float: f64,
+    Boolean: bool,
+    OffsetDateTime: TomlOffsetDateTime,
+    LocalDateTime: TomlLocalDateTime,
+    Date: TomlDate,
+    Time: TomlTime,
+};
+
+pub const TomlOffsetDateTime = struct { date: TomlDate, time: TomlTime, offset: TomlTimezone };
+pub const TomlLocalDateTime = struct { date: TomlDate, time: TomlTime };
+pub const TomlDate = struct {
+    day: u5,
+    month: u4,
+    year: u14,
+    pub const MAX_DAY = 31;
+    pub const MAX_MONTH = 12;
 };
 pub const TomlTime = struct {
-    hour: u8,
-    minute: u8,
-    second: u8,
-    mili_sec: u8,
-    time_offset: ?OffsetTime,
-
-    pub fn init(l: *Lexer) !TomlTime {}
-
-    const OffsetTime = struct { hour: u8, minute: u8 };
+    hour: u5,
+    min: u6,
+    sec: u6,
+    micro: u20,
+    pub const MAX_HOUR = 23;
+    pub const MAX_MIN = 59;
+    pub const MAX_SEC = 59;
+    pub const MAX_MICRO = 999999;
 };
-pub const TomlValue = struct {
-    string: []u8,
-    int: i64,
-    float: TomlFloat,
-    boolean: bool,
-    date: TomlDate,
-    time: TomlTime,
-    date_time: TomlDateTime,
-    array: []TomlValue,
+pub const TomlTimezone = struct {
+    hour: i5,
+    min: u6,
+    pub const MAX_HOUR = 14;
+    pub const MIN_HOUR = -12;
+    pub const MAX_MIN = 59;
 };
+
+test "Toml Skip Tests" {
+    const passed = "passed";
+    const test_whitespace = "    \t  passed";
+    const test_nl_whitespace =
+        \\
+        \\  passed
+    ;
+    const test_comment = "#this should not be visible\npassed";
+    var toml = Toml{
+        .alloc = std.testing.allocator,
+        .text = test_whitespace,
+        .table = undefined,
+    };
+
+    try toml.skipWhitespace();
+    try std.testing.expect(eql(u8, passed, toml.text[toml.idx..]));
+
+    toml.text = test_nl_whitespace;
+    toml.idx = 0;
+    toml.skipNlWhitespace();
+    try std.testing.expect(eql(u8, passed, toml.text[toml.idx..]));
+
+    toml.text = test_comment;
+    toml.idx = 0;
+    toml.skipComment();
+    try std.testing.expect(eql(u8, passed, toml.text[toml.idx..]));
+}
+
+test "Toml Escape Key Test" {
+    const results = [_][]const u8{ &[_]u8{8}, "\t", "\n", &[_]u8{12}, "\r", "\"", "\\", &[_]u8{0x69}, &[_]u8{ 0xFE, 0xCA }, &[_]u8{ 0xBE, 0xBA, 0xFE, 0xCA } };
+    const inputs = [_][]const u8{ "b", "t", "n", "f", "r", "\"", "\\", "x69", "uCafE", "UCaFeBaBe" };
+    var toml = Toml{
+        .alloc = std.testing.allocator,
+        .text = undefined,
+        .table = undefined,
+    };
+
+    for (inputs, 0..) |input, i| {
+        toml.idx = 0;
+        toml.text = input;
+        var output = ArrayList(u8).init(toml.alloc);
+        errdefer output.deinit();
+        const wout = output.writer();
+        try toml.genEscapeKey(wout);
+        var out = try output.toOwnedSlice();
+        std.testing.expect(eql(u8, results[i], out)) catch {
+            std.debug.print("Incorrectly parsed \\{c}\n", .{inputs[i][0]});
+        };
+        toml.alloc.free(out);
+    }
+}
+
+test "Toml Parse Prefixes" {
+    const prefix_lit_str = "p. a ss. \'ed\']";
+    const prefix_str = "p. ass. \"ed\\n\"]";
+    //const prefix_tbl_array = "[p.ass]]";
+    //const prefix_nest_tbl_arr = "[p.ass.ed]]";
+
+    var toml = Toml{
+        .alloc = std.testing.allocator,
+        .text = prefix_lit_str,
+        .table = undefined,
+    };
+
+    try toml.parsePrefix();
+    var prefix1 = toml.active_prefix.?;
+    defer toml.alloc.free(prefix1);
+    try std.testing.expect(eql(u8, prefix1, "p.ass.ed"));
+
+    toml.active_prefix = null;
+    toml.text = prefix_str;
+    toml.idx = 0;
+    try toml.parsePrefix();
+    var prefix2 = toml.active_prefix.?;
+    defer toml.alloc.free(prefix2);
+    try std.testing.expect(eql(u8, prefix2, "p.ass.ed\n"));
+}

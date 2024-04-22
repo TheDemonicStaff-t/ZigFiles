@@ -1,7 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 
-test "Toml Functionality Test" {
-    const Toml = @import("files/Toml.zig");
+pub const Toml = @import("files/Toml.zig");
+
+test "Toml Tests" {
     const test_file = @embedFile("tests/test.toml");
+    var toml = try Toml.init(test_file, std.testing.allocator);
+    toml.deinit();
 }
