@@ -2,6 +2,8 @@ const std = @import("std");
 // imported structures
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const ArrayEntry = std.StringHashMap(u64).Entry;
+const TableEntry = std.StringHashMap(TableValue).Entry;
 // imported functions
 const fixedBufferStream = std.io.fixedBufferStream;
 const eql = std.mem.eql;
@@ -13,7 +15,7 @@ alloc: Allocator,
 table: std.StringHashMap(TableValue),
 text: []const u8,
 active_prefix: ?[]const u8 = null,
-array_counts: ?std.StringHashMap(u64) = null,
+array_counts: std.StringHashMap(u64) = undefined,
 idx: usize = 0,
 
 /// Initializes Toml from recieved text. Result must have deinit() called before end of execution.
@@ -24,21 +26,10 @@ pub fn init(text: []const u8, alloc: Allocator) !Toml {
         .text = text,
         .array_counts = std.StringHashMap(u64).init(alloc),
     };
-    errdefer toml.deinit();
-    try toml.parse();
-    if (toml.array_counts) |arrays| {
-        var array_iter = arrays.iterator();
-        while (array_iter.next()) |entry| alloc.free(entry.key_ptr.*);
-        toml.array_counts.?.deinit();
-        toml.array_counts = null;
-    }
-    if (toml.active_prefix) |prefix| {
-        alloc.free(prefix);
-        toml.active_prefix = null;
-    }
     return toml;
 }
 
+// parsing functions
 /// This is for internal use when initially parsing the initializing text and should not be called outside
 /// of initialization.
 pub fn parse(self: *Toml) !void {
@@ -62,31 +53,51 @@ pub fn parsePrefix(self: *Toml) !void {
     var fin_prefix = ArrayList(u8).init(self.alloc);
     errdefer fin_prefix.deinit();
     const prefix = fin_prefix.writer();
-    var start: usize = 0;
 
     if (self.text[self.idx] == '[') {
         // TODO: Implement table arrays (pain and death)
         self.idx += 1;
-        start = self.idx;
-    } else {
-        start = self.idx;
-        while (self.text.len > self.idx and self.text[self.idx] != ']') : (self.idx += 1) {
-            if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t') {
-                if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
-                try self.skipWhitespace();
-                start = self.idx;
-                self.idx -= 1;
-            } else if (self.text[self.idx] == '\'' or self.text[self.idx] == '\"') {
-                if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
-                var idStr = try self.parseIdString();
-                if (idStr) |str| {
-                    try prefix.writeAll(str);
-                    self.alloc.free(str);
-                }
-                start = self.idx + 1;
-            } else if (self.text[self.idx] == '\n') return error.InvalidPrefixProvided;
+        while (self.idx < self.text.len and self.text[self.idx] != ']') {
+            var next_segment = try self.parseNestedPrefix();
+            try prefix.writeAll(next_segment);
+            self.alloc.free(next_segment);
+
+            var entry = try self.fetchArrayPrefix(fin_prefix.items);
+            if (entry) |ent| {
+                if (self.text[self.idx] != ']') ent.value_ptr.* -= 1;
+                try prefix.print("[{d}]", .{ent.value_ptr.*});
+                ent.value_ptr.* += 1;
+            }
+            if (self.text[self.idx] == '.') {
+                try prefix.writeByte('.');
+                self.idx += 1;
+            }
         }
-        if (self.idx > start) try prefix.writeAll(self.text[start..self.idx]);
+        if (self.idx >= self.text.len) return error.StringOverflow;
+        self.idx += 1;
+        var table_entry = try self.fetchOrGenArrayPrefix(fin_prefix.items);
+        try prefix.print("[{d}]", .{table_entry.value_ptr.*});
+        table_entry.value_ptr.* += 1;
+        self.active_prefix = try fin_prefix.toOwnedSlice();
+    } else {
+        while (self.idx < self.text.len and self.text[self.idx] != ']') {
+            var next_segment = try self.parseNestedPrefix();
+            defer self.alloc.free(next_segment);
+            try prefix.writeAll(next_segment);
+
+            var entry = try self.fetchArrayPrefix(fin_prefix.items);
+            if (entry) |ent| {
+                if (self.text[self.idx] != ']') ent.value_ptr.* -= 1;
+                try prefix.print("[{d}]", .{ent.value_ptr.*});
+                ent.value_ptr.* += 1;
+            }
+            if (self.text[self.idx] == '.') {
+                try prefix.writeByte('.');
+                self.idx += 1;
+            }
+        }
+        if (self.idx >= self.text.len) return error.StringOverflow;
+        self.idx += 1;
         self.active_prefix = try fin_prefix.toOwnedSlice();
     }
 }
@@ -111,7 +122,7 @@ pub fn parseIdString(self: *Toml) !?[]const u8 {
         if (self.text[self.idx] == '\"') return error.MultilineIdStringNotSupported;
         start = self.idx;
 
-        while (self.text[self.idx] != '\"') : (self.idx += 1) {
+        while (self.idx < self.text.len and self.text[self.idx] != '\"') : (self.idx += 1) {
             if (self.text[self.idx] == '\\') {
                 if (start < self.idx) try string.writeAll(self.text[start..self.idx]);
                 self.idx += 1;
@@ -120,32 +131,38 @@ pub fn parseIdString(self: *Toml) !?[]const u8 {
                 self.idx -= 1;
             } else if (self.text[self.idx] == '\n') return error.MultilineIdStringNotSupported;
         }
+        if (self.idx >= self.text.len) return error.StringOverflow;
         try string.writeAll(self.text[start..self.idx]);
         return try fin_string.toOwnedSlice();
     } else return error.InvalidStringTypeProvided;
 }
 /// FOR INTERNAL USE ONLY
-pub fn parseIdSegment(self: *Toml) ![]const u8 {
+pub fn parseNestedPrefix(self: *Toml) ![]const u8 {
     var id_segment = ArrayList(u8).init(self.alloc);
     errdefer id_segment.deinit();
     const segment = id_segment.writer();
-    var start: usize = 0;
+    var start: usize = self.idx;
 
-    while (self.text.len > self.idx and self.text[self.idx] != ']' and self.text[self.idx] != '.') : (self.idx += 1) {
+    while (self.idx < self.text.len and self.text[self.idx] != ']' and self.text[self.idx] != '.') : (self.idx += 1) {
         if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t') {
-            if (self.idx - start > 0) try segment.writeAll(self.text[start..self.idx]);
+            if (self.idx > start) try segment.writeAll(self.text[start..self.idx]);
             try self.skipWhitespace();
             start = self.idx;
-            self.idx -= 1; // decrement so while increment doesn't skip a char check
-        } else if (self.text[self.idx] == '\'' or self.text[self.idx] == '\"') {
-            if (self.idx - start > 0) try segment.writeAll(self.text[start..self.idx]);
-            var idStr = try self.parseIdString();
-            try segment.writeAll(idStr);
-            self.alloc.free(idStr);
-            start = self.idx;
             self.idx -= 1;
+        } else if (self.text[self.idx] == '\'' or self.text[self.idx] == '\"') {
+            if (self.idx > start) try segment.writeAll(self.text[start..self.idx]);
+            var idStr = try self.parseIdString();
+            if (idStr) |str| {
+                try segment.writeAll(str);
+                self.alloc.free(str);
+            }
+            start = self.idx + 1;
         } else if (self.text[self.idx] == '\n') return error.InvalidPrefixProvided;
     }
+    if (self.idx >= self.text.len) return error.StringOverflow;
+    if (self.idx > start) try segment.writeAll(self.text[start..self.idx]);
+
+    return try id_segment.toOwnedSlice();
 }
 /// FOR INTERNAL USE ONLY
 pub fn parseId(self: *Toml) ![]const u8 {
@@ -159,6 +176,26 @@ pub fn parseValue(self: *Toml) !TableValue {
     }
     self.idx += 1;
 }
+
+// fetching functions (internal)
+/// FOR INTERNAL USE ONLY
+pub fn fetchArrayPrefix(self: *Toml, key: []const u8) !?ArrayEntry {
+    return self.array_counts.getEntry(key);
+}
+
+pub fn fetchOrGenArrayPrefix(self: *Toml, key: []const u8) !ArrayEntry {
+    var entry = try self.array_counts.getOrPutValue(key, 0);
+    if (entry.value_ptr.* == 0) {
+        entry.key_ptr.* = try self.alloc.dupe(u8, key);
+    }
+    return entry;
+}
+
+// fetching functions (external)
+
+// insertion functions
+
+// generating functions
 
 /// FOR INTERNAL USE ONLY
 pub fn genEscapeKey(self: *Toml, writer: anytype) !void {
@@ -233,16 +270,16 @@ pub fn skipComment(self: *Toml) void {
 /// This must be called at the end of execution or the end of file life. It frees all of the keys
 /// that have been created.
 pub fn deinit(self: *Toml) void {
-    if (self.array_counts) |arrays| {
-        var array_iter = arrays.iterator();
-        while (array_iter.next()) |entry| self.alloc.free(entry.key_ptr.*);
-        self.array_counts.?.deinit();
-    }
+    var array_iter = self.array_counts.iterator();
+    while (array_iter.next()) |entry| self.alloc.free(entry.key_ptr.*);
+    self.array_counts.deinit();
     if (self.active_prefix) |prefix| self.alloc.free(prefix);
     var hash_iter = self.table.iterator();
     while (hash_iter.next()) |entry| self.alloc.free(entry.key_ptr.*);
     self.table.deinit();
 }
+
+// structures
 
 pub const Loc = struct { start: usize, end: usize };
 pub const Tag = enum {
@@ -293,6 +330,8 @@ pub const TomlTimezone = struct {
     pub const MIN_HOUR = -12;
     pub const MAX_MIN = 59;
 };
+
+// tests
 
 test "Toml Skip Tests" {
     const passed = "passed";
@@ -346,28 +385,49 @@ test "Toml Escape Key Test" {
     }
 }
 
-test "Toml Parse Prefixes" {
-    const prefix_lit_str = "p. a ss. \'ed\']";
-    const prefix_str = "p. ass. \"ed\\n\"]";
-    //const prefix_tbl_array = "[p.ass]]";
-    //const prefix_nest_tbl_arr = "[p.ass.ed]]";
+test "Toml Parse Table Name" {
+    const tbl_name_1 = "p.ass.\'ed\']";
+    const tbl_name_2 = "p.ass.\"e\\x64\"]";
+    const nest_tbl_1 = "[p.ass]]";
+    const nest_tbl_2 = "[p.ass.ed]]";
 
     var toml = Toml{
         .alloc = std.testing.allocator,
-        .text = prefix_lit_str,
+        .text = tbl_name_1,
         .table = undefined,
+        .array_counts = std.StringHashMap(u64).init(std.testing.allocator),
     };
 
-    try toml.parsePrefix();
-    var prefix1 = toml.active_prefix.?;
-    defer toml.alloc.free(prefix1);
-    try std.testing.expect(eql(u8, prefix1, "p.ass.ed"));
+    defer {
+        var array_itter = toml.array_counts.keyIterator();
+        while (array_itter.next()) |entry| toml.alloc.free(entry.*);
+        toml.array_counts.deinit();
+        if (toml.active_prefix) |prefix| toml.alloc.free(prefix);
+    }
 
+    try toml.parsePrefix();
+    try std.testing.expect(eql(u8, "p.ass.ed", toml.active_prefix.?));
+    toml.alloc.free(toml.active_prefix.?);
     toml.active_prefix = null;
-    toml.text = prefix_str;
+
+    toml.text = tbl_name_2;
     toml.idx = 0;
     try toml.parsePrefix();
-    var prefix2 = toml.active_prefix.?;
-    defer toml.alloc.free(prefix2);
-    try std.testing.expect(eql(u8, prefix2, "p.ass.ed\n"));
+    try std.testing.expect(eql(u8, "p.ass.ed", toml.active_prefix.?));
+    toml.alloc.free(toml.active_prefix.?);
+    toml.active_prefix = null;
+
+    toml.text = nest_tbl_1;
+    toml.idx = 0;
+    try toml.parsePrefix();
+    try std.testing.expect(eql(u8, "p.ass[0]", toml.active_prefix.?));
+    toml.alloc.free(toml.active_prefix.?);
+    toml.active_prefix = null;
+
+    toml.text = nest_tbl_2;
+    toml.idx = 0;
+    try toml.parsePrefix();
+    try std.testing.expect(eql(u8, "p.ass[0].ed[0]", toml.active_prefix.?));
+    toml.alloc.free(toml.active_prefix.?);
+    toml.active_prefix = null;
 }
