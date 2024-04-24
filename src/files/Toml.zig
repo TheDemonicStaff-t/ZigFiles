@@ -191,7 +191,7 @@ pub fn parseValue(self: *Toml) !TableValue {
             // gen string
             var start = self.idx;
             self.idx += 1;
-            if (self.text[self.idx] == '\'') {
+            if (self.text[self.idx - 1] == '\'') {
                 // if literal just go until next '
                 var multiline = self.text.len > self.idx + 2 and self.text[self.idx + 1] == '\'' and self.text[self.idx + 2] == '\'';
                 if (multiline) self.idx += 3;
@@ -200,7 +200,7 @@ pub fn parseValue(self: *Toml) !TableValue {
                 if (multiline) {
                     if (self.text.len > self.idx + 2 and self.text[self.idx + 1] == '\'' and self.text[self.idx + 2] == '\'') self.idx += 2 else return error.InvalidMultilineString;
                 }
-                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx } } else return error.StringOverflow;
+                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx + 1 } } else return error.StringOverflow;
             } else {
                 // if base skip \" otherwise go until next "
                 var multiline = self.text.len > self.idx + 2 and self.text[self.idx + 1] == '\"' and self.text[self.idx + 2] == '\"';
@@ -212,7 +212,7 @@ pub fn parseValue(self: *Toml) !TableValue {
                 if (multiline) {
                     if (self.text.len > self.idx + 2 and self.text[self.idx + 1] == '\"' and self.text[self.idx + 2] == '\"') self.idx += 2 else return error.InvalidMultilineString;
                 }
-                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx } } else return error.StringOverflow;
+                return if (self.idx < self.text.len) .{ .tag = .String, .loc = .{ .start = start, .end = self.idx + 1 } } else error.StringOverflow;
             }
         },
         '+', '-', '0'...'9', 'i', 'n' => {
@@ -326,11 +326,12 @@ pub fn parseValue(self: *Toml) !TableValue {
     }
 }
 
-/// FOF INTERNAL USE ONLY (UNTESTED)
+/// FOF INTERNAL USE ONLY (WORKING)
 pub fn parseString(self: *Toml, start: usize, end: usize) ![]const u8 {
+    self.idx = start;
     if (self.text[start] == '\'') {
         // if literal return string copy
-        return try self.alloc.dupe(self.text[start + 1 .. end]);
+        return try self.alloc.dupe(u8, self.text[start + 1 .. end - 1]);
     } else if (self.text[start] == '\"') {
         var string = ArrayList(u8).init(self.alloc);
         errdefer string.deinit();
@@ -348,27 +349,27 @@ pub fn parseString(self: *Toml, start: usize, end: usize) ![]const u8 {
             if (self.text[self.idx] == '\\') {
                 if (self.idx > s_start) try str.writeAll(self.text[s_start..self.idx]);
                 self.idx += 1;
-                try self.genEscapeKey(std);
+                try self.genEscapeKey(str);
                 s_start = self.idx;
                 self.idx -= 1;
             } else if (multiline_enable and self.text[self.idx] == '\n') return error.MultilineStringInSingleString;
         }
         if (self.idx > s_start) try str.writeAll(self.text[s_start..self.idx]);
         // verify valid multiline
-        if (multiline_enable and self.text > self.idx + 2 and self.text[self.idx + 1] == '\"' and self.text[self.idx + 2] == '\"') self.idx += 2;
+        if (multiline_enable and self.text.len > self.idx + 2 and self.text[self.idx + 1] == '\"' and self.text[self.idx + 2] == '\"') self.idx += 2;
         return try string.toOwnedSlice();
     } else return error.UnkownStringType;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseInt(self: *Toml, start: usize, end: usize) !i64 {
-    var signed = false;
+    self.idx = start;
+    var signed = self.text[start] == '-';
     // check if signed
-    self.text[start] == '-';
     var int: i64 = 0;
-    if (self.text[start] == '-' or self.text[self.idx] == '+') self.idx += 1;
+    if (signed or self.text[self.idx] == '+') self.idx += 1;
     if (self.idx < end) {
-        if (self.text[self.idx] == '0' and self.end > self.idx + 2) {
+        if (self.text[self.idx] == '0' and end > self.idx + 2) {
             self.idx += 1;
             switch (self.text[self.idx]) {
                 'x', 'X' => {
@@ -377,7 +378,7 @@ pub fn parseInt(self: *Toml, start: usize, end: usize) !i64 {
                     while (self.idx < end and ((self.text[self.idx] > 47 and self.text[self.idx] < 58) or (self.text[self.idx] > 64 and self.text[self.idx] < 71) or (self.text[self.idx] > 96 and self.text[self.idx] < 103) or self.text[self.idx] == '_')) : (self.idx += 1) {
                         int *= 16;
                         int += if (self.text[self.idx] > 47 and self.text[self.idx] < 58) @as(i64, @intCast(self.text[self.idx])) - 48 else if (self.text[self.idx] > 64 and self.text[self.idx] < 71) @as(i64, self.text[self.idx]) - 55 else if (self.text[self.idx] > 96 and self.text[self.idx] < 103) @as(i64, @intCast(self.text[self.idx])) - 87 else if (self.text[self.idx] == '_') 0 else return error.UnkownDigitRecieved;
-                        if (self.text[self.idx] == '_') int /= 16;
+                        if (self.text[self.idx] == '_') int = @divFloor(int, 16);
                     }
                     if (signed) int *= -1;
                     return int;
@@ -388,8 +389,8 @@ pub fn parseInt(self: *Toml, start: usize, end: usize) !i64 {
                     while (self.idx < end and ((self.text[self.idx] > 47 and self.text[self.idx] < 56) or self.text[self.idx] == '_')) : (self.idx += 1) {
                         int *= 8;
                         if (self.text[self.idx] != '_') {
-                            int += @as(u64, @intCast(self.text[self.idx])) - 48;
-                        } else int /= 8;
+                            int += @as(i64, @intCast(self.text[self.idx])) - 48;
+                        } else int = @divFloor(int, 8);
                     }
                     if (signed) int *= -1;
                     return int;
@@ -400,8 +401,8 @@ pub fn parseInt(self: *Toml, start: usize, end: usize) !i64 {
                     while (self.idx < end and ((self.text[self.idx] > 47 and self.text[self.idx] < 50) or self.text[self.idx] == '_')) : (self.idx += 1) {
                         int *= 2;
                         if (self.text[self.idx] != '_') {
-                            int += @as(u64, @intCast(self.text[self.idx])) - 48;
-                        } else int /= 2;
+                            int += @as(i64, @intCast(self.text[self.idx])) - 48;
+                        } else int = @divFloor(int, 2);
                     }
                     if (signed) int *= -1;
                     return int;
@@ -410,24 +411,23 @@ pub fn parseInt(self: *Toml, start: usize, end: usize) !i64 {
             }
         }
         // parse base 10
-        while (end > self.idx and self.text[self.idx] > 47 and self.text[self.idx] < 56) : (self.idx += 1) {
+        while (end > self.idx and ((self.text[self.idx] > 47 and self.text[self.idx] < 58) or self.text[self.idx] == '_')) : (self.idx += 1) {
             int *= 10;
             if (self.text[self.idx] != '_') {
                 int += @as(i64, @intCast(self.text[self.idx])) - 48;
-            } else int /= 10;
+            } else int = @divFloor(int, 10);
         }
         if (signed) int *= -1;
         return int;
     } else return error.InvalidIntegerDetected;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseFloat(self: *Toml, start: usize, end: usize) !TomlFloat {
     self.idx = start;
     // find signing
-    var signed = false;
-    if (self.text[self.idx] == '-') signed = true;
-    if (self.text[self.idx] == '+' or signed) self.idx += 1;
+    var signed = self.text[self.idx] == '-';
+    if (signed or self.text[self.idx] == '+') self.idx += 1;
     var float = TomlFloat{ .whole = 0, .part = 0, .exp = 0 };
     // find whole part of float
     while (self.idx < end and self.text[self.idx] != '.' and self.text[self.idx] != 'e' and self.text[self.idx] != 'E') : (self.idx += 1) {
@@ -435,7 +435,7 @@ pub fn parseFloat(self: *Toml, start: usize, end: usize) !TomlFloat {
         if (self.text[self.idx] > 47 and self.text[self.idx] < 58) {
             float.whole += @as(i64, @intCast(self.text[self.idx])) - 48;
         } else if (self.text[self.idx] == '_') {
-            float.whole /= 10;
+            float.whole = @divFloor(float.whole, 10);
         } else return error.InvalidFloatCharacter;
     }
     if (signed) float.whole *= -1;
@@ -444,30 +444,30 @@ pub fn parseFloat(self: *Toml, start: usize, end: usize) !TomlFloat {
     // find fraction of float
     if (self.text[self.idx] == '.') {
         self.idx += 1;
-        while (self.idx < end and self.text[self.idx] != '.' and self.text[self.idx] != 'e' and self.text[self.idx] != 'E') : (self.idx += 1) {
+        while (self.idx < end and self.text[self.idx] != 'e' and self.text[self.idx] != 'E') : (self.idx += 1) {
             float.part *= 10;
             // add or skip _
             if (self.text[self.idx] > 47 and self.text[self.idx] < 58) {
-                float.part += @as(i64, @intCast(self.text[self.idx])) - 48;
+                float.part += @as(u64, @intCast(self.text[self.idx])) - 48;
             } else if (self.text[self.idx] == '_') {
-                float.part /= 10;
+                float.part = @divFloor(float.part, 10);
             } else return error.InvalidFloatCharacter;
         }
     }
 
     // find exponent of fraction
-    if (self.text[self.idx] == 'e' or self.text[self.idx] == 'E') {
+    if (self.text.len > self.idx + 2 and (self.text[self.idx] == 'e' or self.text[self.idx] == 'E')) {
         self.idx += 1;
         // signing
         if (self.text[self.idx] == '-') signed = true;
         if (self.text[self.idx] == '+' or signed) self.idx += 1;
         while (self.idx < end and self.text[self.idx] != '.' and self.text[self.idx] != 'e' and self.text[self.idx] != 'E') : (self.idx += 1) {
-            float.part *= 10;
+            float.exp *= 10;
             // add or skip _
             if (self.text[self.idx] > 47 and self.text[self.idx] < 58) {
                 float.exp += @as(i64, @intCast(self.text[self.idx])) - 48;
             } else if (self.text[self.idx] == '_') {
-                float.exp /= 10;
+                float.exp = @divFloor(float.exp, 10);
             } else return error.InvalidFloatCharacter;
         }
         if (signed) float.exp *= -1;
@@ -476,16 +476,16 @@ pub fn parseFloat(self: *Toml, start: usize, end: usize) !TomlFloat {
     return float;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseBoolean(self: *Toml, start: usize, end: usize) !bool {
-    if (start - end == 4) {
+    if (end - start == 4) {
         if (eql(u8, "true", self.text[start..end])) return true else return error.InvalidBoolProvided;
-    } else if (start - end == 5) {
+    } else if (end - start == 5) {
         if (eql(u8, "false", self.text[start..end])) return false else return error.InvalidBoolProvided;
     } else return error.InvalidBoolProvided;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseConcept(self: *Toml, start: usize, end: usize) !TomlConcept {
     self.idx = start;
     // check for sign (ignored)
@@ -498,10 +498,11 @@ pub fn parseConcept(self: *Toml, start: usize, end: usize) !TomlConcept {
     } else return error.UnknownConceptProvided;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseTime(self: *Toml, start: usize) !TomlTime {
     self.idx = start;
     var time = TomlTime{ .hour = 0, .min = 0, .sec = 0, .micro = 0 };
+    if (self.text.len < self.idx + 8) return error.InvalidTime;
     // parse hour
     time.hour += @as(u5, @intCast(self.text[self.idx] - 48)) * 10;
     time.hour += @as(u5, @intCast(self.text[self.idx + 1] - 48));
@@ -509,17 +510,17 @@ pub fn parseTime(self: *Toml, start: usize) !TomlTime {
     // parse minute
     if (self.text[self.idx] != ':') return error.InvalidTime;
     self.idx += 1;
-    time.min += @as(u5, @intCast(self.text[self.idx] - 48)) * 10;
-    time.min += @as(u5, @intCast(self.text[self.idx + 1] - 48));
+    time.min += @as(u6, @intCast(self.text[self.idx] - 48)) * 10;
+    time.min += @as(u6, @intCast(self.text[self.idx + 1] - 48));
     self.idx += 2;
     // parse second
     if (self.text[self.idx] != ':') return error.InvalidTime;
     self.idx += 1;
-    time.sec += @as(u5, @intCast(self.text[self.idx] - 48)) * 10;
-    time.sec += @as(u5, @intCast(self.text[self.idx + 1] - 48));
+    time.sec += @as(u6, @intCast(self.text[self.idx] - 48)) * 10;
+    time.sec += @as(u6, @intCast(self.text[self.idx + 1] - 48));
     self.idx += 2;
     // parse fraction
-    if (self.text[self.idx] == '.') {
+    if (self.text.len > self.idx + 1 and self.text[self.idx] == '.') {
         while (self.text[self.idx] > 47 and self.text[self.idx] < 56) {
             time.micro *= 10;
             time.micro += @as(u5, @intCast(self.text[self.idx + 1] - 48));
@@ -528,7 +529,7 @@ pub fn parseTime(self: *Toml, start: usize) !TomlTime {
     return time;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseDate(self: *Toml, start: usize) !TomlDate {
     self.idx = start;
     var date = TomlDate{ .year = 0, .month = 0, .day = 0 };
@@ -553,7 +554,7 @@ pub fn parseDate(self: *Toml, start: usize) !TomlDate {
     return date;
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseLocalDateTime(self: *Toml, start: usize) !TomlLocalDateTime {
     // parse date and time
     self.idx = start;
@@ -564,7 +565,7 @@ pub fn parseLocalDateTime(self: *Toml, start: usize) !TomlLocalDateTime {
     return TomlLocalDateTime{ .date = date, .time = time };
 }
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn parseOffsetDateTime(self: *Toml, start: usize) !TomlOffsetDateTime {
     // parse date and time of value
     self.idx = start;
@@ -588,16 +589,36 @@ pub fn parseOffsetDateTime(self: *Toml, start: usize) !TomlOffsetDateTime {
     return .{ .date = date_time.date, .time = date_time.time, .offset = offset };
 }
 
-/// FOR INTERNAL USE ONLY (INCOMPLETE)
-pub fn parseArray(self: *Toml, start: usize) ![]TomlValue {
+/// FOR INTERNAL USE ONLY (UNTESTED)
+pub fn parseArray(self: *Toml, start: usize) anyerror![]TomlValue {
     self.idx = start;
     if (self.text[self.idx] != '[') return error.InvalidArrayProvided;
     var values = ArrayList(TomlValue).init(self.alloc);
-    errdefer values.deinit();
+    errdefer {
+        for (values.items) |item| {
+            if (std.meta.activeTag(item) == .String) {
+                self.alloc.free(item.String);
+            } else if (std.meta.activeTag(item) == .Array) {
+                self.deinitArray(item.Array);
+            }
+        }
+        values.deinit();
+    }
+    self.idx += 1;
 
     while (self.text.len > self.idx and self.text[self.idx] != ']') : (self.idx += 1) {
-        switch (self.text[self.idx]) {}
+        var tableVal = try self.parseValue();
+        try values.append(try self.genTomlValue(tableVal));
+        self.idx = tableVal.loc.end;
+        if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t' or self.text[self.idx] == '\n') self.skipNlWhitespace();
+        if (self.text[self.idx] == ',') {
+            self.idx += 1;
+        } else if (self.text[self.idx] != ']') return error.InvalidArrayProvided;
+        if (self.text[self.idx] == ' ' or self.text[self.idx] == '\t' or self.text[self.idx] == '\n') self.skipNlWhitespace();
+        self.idx -= 1;
     }
+
+    return try values.toOwnedSlice();
 }
 
 // fetching functions (internal)
@@ -623,7 +644,7 @@ pub fn fetchOrGenArrayPrefix(self: *Toml, key: []const u8) !ArrayEntry {
 
 // generating functions
 
-/// FOR INTERNAL USE ONLY (UNTESTED)
+/// FOR INTERNAL USE ONLY (WORKING)
 pub fn genTomlValue(self: *Toml, value: TableValue) !TomlValue {
     // generate appropriate TomlValue based on tag
     switch (value.tag) {
@@ -631,13 +652,12 @@ pub fn genTomlValue(self: *Toml, value: TableValue) !TomlValue {
         .Integer => return @unionInit(TomlValue, "Integer", try self.parseInt(value.loc.start, value.loc.end)),
         .Float => return @unionInit(TomlValue, "Float", try self.parseFloat(value.loc.start, value.loc.end)),
         .Boolean => return @unionInit(TomlValue, "Boolean", try self.parseBoolean(value.loc.start, value.loc.end)),
-        .Concept => return @unionInit(TomlValue, "Boolean", try self.parseConcept(value.loc.start, value.loc.end)),
+        .Concept => return @unionInit(TomlValue, "Concept", try self.parseConcept(value.loc.start, value.loc.end)),
         .Date => return @unionInit(TomlValue, "Date", try self.parseDate(value.loc.start)),
         .Time => return @unionInit(TomlValue, "Time", try self.parseTime(value.loc.start)),
         .LocalDateTime => return @unionInit(TomlValue, "LocalDateTime", try self.parseLocalDateTime(value.loc.start)),
         .OffsetDateTime => return @unionInit(TomlValue, "OffsetDateTime", try self.parseOffsetDateTime(value.loc.start)),
-        .Array => {},
-        else => @compileError("Values Of Type " ++ @tagName(value.tag) ++ " Is not yet parsable"),
+        .Array => return @unionInit(TomlValue, "Array", try self.parseArray(value.loc.start)),
     }
 }
 
@@ -735,6 +755,71 @@ pub fn deinit(self: *Toml) void {
     self.table.deinit();
 }
 
+/// Must be called when generating Array with nested arrays or in general when generating a Toml Array
+/// (WORKING)
+pub fn deinitArray(self: *Toml, arr: []const TomlValue) void {
+    for (arr) |val| {
+        switch (std.meta.activeTag(val)) {
+            .String => self.alloc.free(val.String),
+            .Array => self.deinitArray(val.Array),
+            else => {},
+        }
+    }
+    self.alloc.free(arr);
+}
+
+/// TESTING FUNCTION, DO NOT CALL
+pub fn test_toml_val(tval: TomlValue, val: TomlValue) !void {
+    try std.testing.expect(std.meta.activeTag(val) == std.meta.activeTag(tval));
+    switch (std.meta.activeTag(tval)) {
+        .String => try std.testing.expect(eql(u8, tval.String, val.String)),
+        .Integer => try std.testing.expect(tval.Integer == val.Integer),
+        .Float => {
+            try std.testing.expect(tval.Float.whole == val.Float.whole);
+            try std.testing.expect(tval.Float.part == val.Float.part);
+            try std.testing.expect(tval.Float.exp == val.Float.exp);
+        },
+        .Boolean => try std.testing.expect(tval.Boolean == val.Boolean),
+        .Concept => try std.testing.expect(tval.Concept == val.Concept),
+        .Date => {
+            try std.testing.expect(tval.Date.year == val.Date.year);
+            try std.testing.expect(tval.Date.month == val.Date.month);
+            try std.testing.expect(tval.Date.day == val.Date.day);
+        },
+        .Time => {
+            try std.testing.expect(tval.Time.hour == val.Time.hour);
+            try std.testing.expect(tval.Time.min == val.Time.min);
+            try std.testing.expect(tval.Time.sec == val.Time.sec);
+            try std.testing.expect(tval.Time.micro == val.Time.micro);
+        },
+        .LocalDateTime => {
+            try std.testing.expect(tval.LocalDateTime.date.year == val.LocalDateTime.date.year);
+            try std.testing.expect(tval.LocalDateTime.date.month == val.LocalDateTime.date.month);
+            try std.testing.expect(tval.LocalDateTime.date.day == val.LocalDateTime.date.day);
+            try std.testing.expect(tval.LocalDateTime.time.hour == val.LocalDateTime.time.hour);
+            try std.testing.expect(tval.LocalDateTime.time.min == val.LocalDateTime.time.min);
+            try std.testing.expect(tval.LocalDateTime.time.sec == val.LocalDateTime.time.sec);
+            try std.testing.expect(tval.LocalDateTime.time.micro == val.LocalDateTime.time.micro);
+        },
+        .OffsetDateTime => {
+            try std.testing.expect(tval.OffsetDateTime.date.year == val.OffsetDateTime.date.year);
+            try std.testing.expect(tval.OffsetDateTime.date.month == val.OffsetDateTime.date.month);
+            try std.testing.expect(tval.OffsetDateTime.date.day == val.OffsetDateTime.date.day);
+            try std.testing.expect(tval.OffsetDateTime.time.hour == val.OffsetDateTime.time.hour);
+            try std.testing.expect(tval.OffsetDateTime.time.min == val.OffsetDateTime.time.min);
+            try std.testing.expect(tval.OffsetDateTime.time.sec == val.OffsetDateTime.time.sec);
+            try std.testing.expect(tval.OffsetDateTime.time.micro == val.OffsetDateTime.time.micro);
+            try std.testing.expect(tval.OffsetDateTime.offset.hour == val.OffsetDateTime.offset.hour);
+            try std.testing.expect(tval.OffsetDateTime.offset.min == val.OffsetDateTime.offset.min);
+        },
+        .Array => {
+            for (val.Array, tval.Array) |v, tv| {
+                try test_toml_val(tv, v);
+            }
+        },
+    }
+}
+
 // structures
 /// for use in table
 /// holds start and end of value
@@ -768,7 +853,7 @@ pub const TomlValue = union(Tag) {
     LocalDateTime: TomlLocalDateTime,
     Date: TomlDate,
     Time: TomlTime,
-    Array: []TomlValue,
+    Array: []const TomlValue,
 };
 /// for external use
 /// contains number concepts like infinity and not a number
@@ -921,6 +1006,24 @@ test "Toml Table Name Test" {
 }
 
 test "Toml Value Parse Test" {
+    const mixed_test_arr = [_]TomlValue{
+        @unionInit(TomlValue, "String", "p"),
+        @unionInit(TomlValue, "Integer", 1),
+        @unionInit(TomlValue, "String", "u"),
+        @unionInit(TomlValue, "Integer", 2),
+        @unionInit(TomlValue, "String", "b"),
+        @unionInit(TomlValue, "Integer", 3),
+        @unionInit(TomlValue, "String", "l"),
+        @unionInit(TomlValue, "Integer", 4),
+        @unionInit(TomlValue, "String", "i"),
+        @unionInit(TomlValue, "Integer", 5),
+        @unionInit(TomlValue, "String", "c"),
+        @unionInit(TomlValue, "Integer", 6),
+    };
+    const test_arr = [_]TomlValue{
+        @unionInit(TomlValue, "String", "test"),
+        @unionInit(TomlValue, "String", "passed"),
+    };
     const tests = [_][]const u8{
         "\"\\\"passed\\\"\"",
         "69420",
@@ -943,7 +1046,7 @@ test "Toml Value Parse Test" {
         "['p', 1, 'u', 2, 'b', 3, 'l', 4, 'i', 5, 'c', 6]",
     };
     const table_results = [_]TableValue{
-        .{ .tag = .String, .loc = .{ .start = 0, .end = 11 } },
+        .{ .tag = .String, .loc = .{ .start = 0, .end = 12 } },
         .{ .tag = .Integer, .loc = .{ .start = 0, .end = 5 } },
         .{ .tag = .Integer, .loc = .{ .start = 0, .end = 6 } },
         .{ .tag = .Integer, .loc = .{ .start = 0, .end = 6 } },
@@ -971,8 +1074,8 @@ test "Toml Value Parse Test" {
         @unionInit(TomlValue, "Integer", 0xcafebabe),
         @unionInit(TomlValue, "Integer", 0o377),
         @unionInit(TomlValue, "Integer", 0b10111011),
-        @unionInit(TomlValue, "Floats", TomlFloat{ .whole = 3, .part = 14159 }),
-        @unionInit(TomlValue, "Floats", TomlFloat{ .whole = 6, .part = 22, .exp = -23 }),
+        @unionInit(TomlValue, "Float", TomlFloat{ .whole = 3, .part = 14159 }),
+        @unionInit(TomlValue, "Float", TomlFloat{ .whole = 6, .part = 22, .exp = -23 }),
         @unionInit(TomlValue, "Concept", TomlConcept.INFINITY),
         @unionInit(TomlValue, "Concept", TomlConcept.NOT_A_NUMBER),
         @unionInit(TomlValue, "Boolean", true),
@@ -981,27 +1084,12 @@ test "Toml Value Parse Test" {
         @unionInit(TomlValue, "LocalDateTime", TomlLocalDateTime{ .date = .{ .day = 10, .month = 4, .year = 2024 }, .time = .{ .hour = 1, .min = 0, .sec = 12, .micro = 0 } }),
         @unionInit(TomlValue, "Date", TomlDate{ .day = 10, .month = 4, .year = 2024 }),
         @unionInit(TomlValue, "Time", TomlTime{ .hour = 1, .min = 0, .sec = 58, .micro = 0 }),
-        @unionInit(TomlValue, "Array", [_]TomlValue{
-            @unionInit(TomlValue, "String", "test"),
-            @unionInit(TomlValue, "String", "passed"),
-        }),
-        @unionInit(TomlValue, "Array", [_]TomlValue{
-            @unionInit(TomlValue, "String", "p"),
-            @unionInit(TomlValue, "Integer", 1),
-            @unionInit(TomlValue, "String", "u"),
-            @unionInit(TomlValue, "Integer", 2),
-            @unionInit(TomlValue, "String", "b"),
-            @unionInit(TomlValue, "Integer", 3),
-            @unionInit(TomlValue, "String", "l"),
-            @unionInit(TomlValue, "Integer", 4),
-            @unionInit(TomlValue, "String", "i"),
-            @unionInit(TomlValue, "Integer", 5),
-            @unionInit(TomlValue, "String", "c"),
-            @unionInit(TomlValue, "Integer", 6),
-        }),
+        @unionInit(TomlValue, "Array", &test_arr),
+        @unionInit(TomlValue, "Array", &mixed_test_arr),
     };
 
-    for (tests, table_results[0..tests.len], toml_results[0..tests.len]) |input, table, tval| {
+    for (tests, table_results[0..tests.len], toml_results[0..tests.len], 0..) |input, table, tval, i| {
+        errdefer std.debug.print("Errored on value[{d}]\n", .{i});
         var toml = Toml{
             .alloc = std.testing.allocator,
             .table = undefined,
@@ -1009,6 +1097,7 @@ test "Toml Value Parse Test" {
         };
 
         // test all possible parseable value types
+
         var out = try toml.parseValue();
         try std.testing.expect(out.tag == table.tag);
         try std.testing.expect(out.loc.start == table.loc.start);
@@ -1016,18 +1105,11 @@ test "Toml Value Parse Test" {
 
         // test all possible parsable return values
         var val = try toml.genTomlValue(out);
-        try std.testing.expect(std.meta.activeTag(val) == std.meta.activeTag(tval));
-        switch (std.meta.activeTag(tval)) {
-            .String => {},
-            .Integer => {},
-            .Float => {},
-            .Boolean => {},
-            .Concept => {},
-            .Date => {},
-            .Time => {},
-            .LocalDateTime => {},
-            .OffsetDateTime => {},
-            .Array => {},
+        defer {
+            if (std.meta.activeTag(val) == .Array) {
+                toml.deinitArray(val.Array);
+            } else if (std.meta.activeTag(val) == .String) toml.alloc.free(val.String);
         }
+        try test_toml_val(tval, val);
     }
 }
